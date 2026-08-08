@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+
+import argparse, concurrent.futures, json, os, shlex, shutil, subprocess, sys, tempfile
+
+from pathlib import Path
+
+
+class BuildFailure(RuntimeError):
+    pass
+
+
+BITCODE_MAGICS = (b"BC\xc0\xde", b"\xde\xc0\x17\x0b")
+UNSPLITTABLE_ALLOCATED_SECTIONS = {
+    ".bss",
+    ".data",
+    ".rodata",
+    ".sbss",
+    ".sdata",
+    ".text",
+}
+
+
+def discover_platforms(sdk_root: Path) -> list[str]:
+    source_platforms = {
+        path.name for path in (sdk_root / "src").iterdir() if path.is_dir()
+    }
+    include_platforms = {
+        path.name for path in (sdk_root / "include").iterdir() if path.is_dir()
+    }
+    linker_platforms = {
+        path.stem for path in (sdk_root / "linker").glob("*.ld") if path.is_file()
+    }
+    data_platforms = {
+        path.parent.parent.name
+        for path in (sdk_root / "src").glob("*/data/data.c")
+        if path.is_file()
+    }
+    return sorted(
+        source_platforms & include_platforms & linker_platforms & data_platforms
+    )
+
+
+def parse_arguments(sdk_root: Path) -> argparse.Namespace:
+    supported_platforms = discover_platforms(sdk_root)
+    if not supported_platforms:
+        raise BuildFailure("no complete SDK platform was found")
+
+    parser = argparse.ArgumentParser(
+        prog="airoha-npu-fdk-build",
+        description=(
+            "Build paired NPU RV32 and data images. Sources and headers for the "
+            "selected platform are discovered automatically."
+        ),
+    )
+    parser.add_argument(
+        "--platform",
+        required=True,
+        choices=supported_platforms,
+        metavar="PLATFORM",
+        help=f"target platform (supported: {', '.join(supported_platforms)})",
+    )
+    parser.add_argument(
+        "inputs",
+        metavar="INPUT",
+        nargs="*",
+        help="input .c, .o, or .a files; defaults to <platform>-npu.c",
+    )
+    parser.add_argument(
+        "-I",
+        dest="include_groups",
+        action="append",
+        default=[],
+        metavar="DIR[,DIR...]",
+        help="comma-separated additional include search directories",
+    )
+    parser.add_argument(
+        "-o",
+        dest="output",
+        default="npu",
+        metavar="BASE",
+        help=(
+            "output base path used to create <base>_rv32.bin and "
+            "<base>_data.bin; defaults to npu in the current directory"
+        ),
+    )
+    parser.add_argument(
+        "--debug-directory",
+        metavar="DIR",
+        help="also preserve firmware.elf and firmware.map in DIR",
+    )
+    return parser.parse_args()
+
+
+def resolve_output_paths(raw_output: str) -> tuple[Path, Path]:
+    output_base = Path(raw_output).expanduser()
+    if not raw_output or output_base.name in {"", ".", ".."}:
+        raise BuildFailure("-o must contain a non-empty base filename")
+    output_base = output_base.resolve()
+
+    return (
+        output_base.with_name(f"{output_base.name}_rv32.bin"),
+        output_base.with_name(f"{output_base.name}_data.bin"),
+    )
+
+
+def replace_output(source: Path, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{output.name}.", dir=output.parent, delete=False
+    ) as staged_output:
+        staged_output_path = Path(staged_output.name)
+    try:
+        shutil.copyfile(source, staged_output_path)
+        staged_output_path.chmod(0o644)
+        os.replace(staged_output_path, output)
+    finally:
+        staged_output_path.unlink(missing_ok=True)
+
+
+def run_command(command: list[str], description: str) -> None:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    details = result.stderr.strip() or result.stdout.strip()
+    message = f"{description} failed\ncommand: {shlex.join(command)}"
+    if details:
+        message = f"{message}\n{details}"
+    raise BuildFailure(message)
+
+
+def json_name(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return ""
+    name = value.get("Name", "")
+    if isinstance(name, str):
+        return name
+    if isinstance(name, dict):
+        nested_name = name.get("Name", "")
+        return nested_name if isinstance(nested_name, str) else ""
+    return ""
+
+
+def validate_native_object(object_data: bytes, label: str, object_reader: str) -> None:
+    result = subprocess.run(
+        [
+            object_reader,
+            "--elf-output-style=JSON",
+            "--sections",
+            "--symbols",
+            "-",
+        ],
+        input=object_data,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        details = result.stderr.decode(errors="replace").strip()
+        message = f"cannot inspect prebuilt input {label}"
+        if details:
+            message = f"{message}\n{details}"
+        raise BuildFailure(message)
+
+    try:
+        documents = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BuildFailure(f"invalid object metadata for {label}") from error
+    if not isinstance(documents, list) or len(documents) != 1:
+        raise BuildFailure(f"unsupported prebuilt object format: {label}")
+
+    document = documents[0]
+    summary = document.get("FileSummary", {})
+    if summary.get("Format") != "elf32-littleriscv" or summary.get("Arch") != "riscv32":
+        raise BuildFailure(
+            f"prebuilt input is not a little-endian RV32 ELF object: {label}"
+        )
+
+    sections = {}
+    for wrapped_section in document.get("Sections", []):
+        section = wrapped_section.get("Section", {})
+        name = json_name(section.get("Name", ""))
+        sections[name] = section
+        flags = section.get("Flags", {}).get("Flags", [])
+        allocated = any(json_name(flag) == "SHF_ALLOC" for flag in flags)
+        if (
+            allocated
+            and section.get("Size", 0) != 0
+            and name in UNSPLITTABLE_ALLOCATED_SECTIONS
+        ):
+            raise BuildFailure(
+                f"prebuilt input cannot be dead-code stripped per symbol: {label} "
+                f"contains non-empty {name}; rebuild it with -flto or "
+                "-ffunction-sections -fdata-sections"
+            )
+
+    symbols_by_section = {}
+    for wrapped_symbol in document.get("Symbols", []):
+        symbol = wrapped_symbol.get("Symbol", {})
+        symbol_type = json_name(symbol.get("Type", ""))
+        section_name = json_name(symbol.get("Section", ""))
+        if symbol_type not in {"Function", "Object"} or section_name not in sections:
+            continue
+        symbols_by_section.setdefault(section_name, []).append(
+            json_name(symbol.get("Name", ""))
+        )
+    for section_name, symbols in symbols_by_section.items():
+        if len(symbols) > 1:
+            raise BuildFailure(
+                f"prebuilt input cannot be dead-code stripped per symbol: {label} "
+                f"places {', '.join(symbols)} in {section_name}; rebuild it with "
+                "-flto or -ffunction-sections -fdata-sections"
+            )
+
+
+def validate_object_data(object_data: bytes, label: str, object_reader: str) -> None:
+    if object_data.startswith(BITCODE_MAGICS):
+        return
+    validate_native_object(object_data, label, object_reader)
+
+
+def validate_prebuilt_inputs(objects: list[Path], archives: list[Path]) -> None:
+    if not objects and not archives:
+        return
+
+    object_reader = os.environ.get("LLVM_READOBJ", "llvm-readobj")
+    archiver = os.environ.get("LLVM_AR", "llvm-ar")
+    if shutil.which(object_reader) is None:
+        raise BuildFailure(f"object reader not found: {object_reader}")
+    if archives and shutil.which(archiver) is None:
+        raise BuildFailure(f"archive reader not found: {archiver}")
+
+    for object_path in objects:
+        try:
+            object_data = object_path.read_bytes()
+        except OSError as error:
+            raise BuildFailure(f"cannot read prebuilt input: {object_path}") from error
+        validate_object_data(object_data, str(object_path), object_reader)
+
+    for archive_path in archives:
+        try:
+            archive_magic = archive_path.read_bytes()[:8]
+        except OSError as error:
+            raise BuildFailure(f"cannot read archive input: {archive_path}") from error
+        thin_archive = archive_magic == b"!<thin>\n"
+        members_result = subprocess.run(
+            [archiver, "t", str(archive_path)], capture_output=True, text=True
+        )
+        if members_result.returncode != 0:
+            details = members_result.stderr.strip()
+            message = f"cannot inspect archive input {archive_path}"
+            if details:
+                message = f"{message}\n{details}"
+            raise BuildFailure(message)
+        members = [member for member in members_result.stdout.splitlines() if member]
+        if not members:
+            raise BuildFailure(f"archive input is empty: {archive_path}")
+        if len(members) != len(set(members)):
+            raise BuildFailure(
+                f"archive input has duplicate member names and cannot be audited: "
+                f"{archive_path}"
+            )
+        for member in members:
+            if thin_archive:
+                member_path = Path(member)
+                if not member_path.is_absolute():
+                    member_path = archive_path.parent / member_path
+                try:
+                    member_data = member_path.read_bytes()
+                except OSError as error:
+                    raise BuildFailure(
+                        f"cannot inspect thin archive member "
+                        f"{archive_path}({member})"
+                    ) from error
+                validate_object_data(
+                    member_data,
+                    f"{archive_path}({member})",
+                    object_reader,
+                )
+                continue
+
+            member_result = subprocess.run(
+                [archiver, "p", str(archive_path), member], capture_output=True
+            )
+            if member_result.returncode != 0:
+                details = member_result.stderr.decode(errors="replace").strip()
+                message = f"cannot inspect archive member {archive_path}({member})"
+                if details:
+                    message = f"{message}\n{details}"
+                raise BuildFailure(message)
+            validate_object_data(
+                member_result.stdout,
+                f"{archive_path}({member})",
+                object_reader,
+            )
+
+
+def resolve_inputs(
+    arguments: argparse.Namespace, sdk_root: Path, platform: str
+) -> list[Path]:
+    raw_inputs = arguments.inputs or [str(sdk_root / f"{platform}-npu.c")]
+    inputs = []
+    seen = set()
+
+    for raw_input in raw_inputs:
+        input_path = Path(raw_input).expanduser().resolve()
+        if input_path.suffix not in {".c", ".o", ".a"}:
+            raise BuildFailure(f"unsupported input type: {raw_input}")
+        if not input_path.is_file():
+            raise BuildFailure(f"input file does not exist: {raw_input}")
+        if input_path in seen:
+            raise BuildFailure(f"duplicate input file: {raw_input}")
+        seen.add(input_path)
+        inputs.append(input_path)
+    return inputs
+
+
+def resolve_include_directories(arguments: argparse.Namespace) -> list[Path]:
+    include_directories = []
+    seen = set()
+
+    for include_group in arguments.include_groups:
+        for raw_directory in include_group.split(","):
+            raw_directory = raw_directory.strip()
+            if not raw_directory:
+                raise BuildFailure("-I contains an empty directory path")
+            directory = Path(raw_directory).expanduser().resolve()
+            if not directory.is_dir():
+                raise BuildFailure(f"include directory does not exist: {raw_directory}")
+            if directory not in seen:
+                seen.add(directory)
+                include_directories.append(directory)
+    return include_directories
+
+
+def compile_source(
+    compiler: str,
+    source: Path,
+    output: Path,
+    common_flags: list[str],
+    include_directories: list[Path],
+    is_assembly: bool,
+    use_lto: bool = True,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [compiler, *common_flags]
+    if not is_assembly:
+        command.extend(
+            [
+                "-std=c11",
+                "-Oz",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Wconversion",
+                "-Wshadow",
+                "-Wstrict-prototypes",
+                "-Wcast-align",
+                "-Waddress-of-packed-member",
+            ]
+        )
+        if use_lto:
+            command.append("-flto")
+    for include_directory in include_directories:
+        command.append(f"-I{include_directory}")
+    command.extend(["-c", str(source), "-o", str(output)])
+    run_command(command, f"compiling {source}")
+
+
+def main() -> int:
+    sdk_root = Path(__file__).resolve().parent
+    arguments = parse_arguments(sdk_root)
+    platform = arguments.platform
+    source_root = sdk_root / "src" / platform
+    include_root = sdk_root / "include"
+    platform_include_root = include_root / platform
+    linker_script = sdk_root / "linker" / f"{platform}.ld"
+    data_source = source_root / "data" / "data.c"
+    compiler = os.environ.get("LLVM_CC", "clang")
+    objcopy = os.environ.get("LLVM_OBJCOPY", "llvm-objcopy")
+
+    if shutil.which(compiler) is None:
+        raise BuildFailure(f"compiler not found: {compiler}")
+    if shutil.which(objcopy) is None:
+        raise BuildFailure(f"objcopy not found: {objcopy}")
+    if not source_root.is_dir() or not platform_include_root.is_dir():
+        raise BuildFailure(
+            f"the SDK src/{platform} and include/{platform} trees are required"
+        )
+    if not linker_script.is_file():
+        raise BuildFailure(f"linker script does not exist: {linker_script}")
+    if not data_source.is_file():
+        raise BuildFailure(f"data image source does not exist: {data_source}")
+
+    inputs = resolve_inputs(arguments, sdk_root, platform)
+    additional_include_directories = resolve_include_directories(arguments)
+    rv32_output, data_output = resolve_output_paths(arguments.output)
+    debug_directory = (
+        Path(arguments.debug_directory).expanduser().resolve()
+        if arguments.debug_directory
+        else None
+    )
+    if rv32_output in inputs or data_output in inputs:
+        raise BuildFailure("an output path must not overwrite an input file")
+    for output in (rv32_output, data_output):
+        if output.exists() and output.is_dir():
+            raise BuildFailure(f"the output path is a directory: {output}")
+    sdk_c_sources = sorted(
+        source for source in source_root.rglob("*.c") if source != data_source
+    )
+    sdk_assembly_sources = sorted(source_root.rglob("*.S"))
+    user_c_sources = [input_path for input_path in inputs if input_path.suffix == ".c"]
+    user_objects = [input_path for input_path in inputs if input_path.suffix == ".o"]
+    user_archives = [input_path for input_path in inputs if input_path.suffix == ".a"]
+    validate_prebuilt_inputs(user_objects, user_archives)
+    common_flags = [
+        "--target=riscv32-unknown-elf",
+        "-march=rv32imc_zicsr_zifencei",
+        "-mabi=ilp32",
+        "-mcmodel=medany",
+        "-mno-relax",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-common",
+        "-fno-pic",
+        "-fno-pie",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fno-unwind-tables",
+        "-fno-asynchronous-unwind-tables",
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="airoha-npu-fdk-build-") as temporary:
+        temporary_root = Path(temporary)
+        platform_data_object = temporary_root / "platform-data.o"
+        sdk_c_objects = [
+            temporary_root / "sdk-c" / source.relative_to(source_root).with_suffix(".o")
+            for source in sdk_c_sources
+        ]
+        sdk_assembly_objects = [
+            temporary_root
+            / "sdk-assembly"
+            / source.relative_to(source_root).with_suffix(".o")
+            for source in sdk_assembly_sources
+        ]
+        user_c_objects = [
+            temporary_root / "user" / f"{index:04d}.o"
+            for index in range(len(user_c_sources))
+        ]
+        compile_jobs = []
+
+        compile_jobs.append(
+            (data_source, platform_data_object, [include_root], False, False)
+        )
+
+        for source, object_path in zip(sdk_c_sources, sdk_c_objects, strict=True):
+            compile_jobs.append(
+                (
+                    source,
+                    object_path,
+                    [include_root],
+                    False,
+                    True,
+                )
+            )
+        for source, object_path in zip(
+            sdk_assembly_sources, sdk_assembly_objects, strict=True
+        ):
+            compile_jobs.append(
+                (
+                    source,
+                    object_path,
+                    [include_root],
+                    True,
+                    False,
+                )
+            )
+        for source, object_path in zip(user_c_sources, user_c_objects, strict=True):
+            compile_jobs.append(
+                (
+                    source,
+                    object_path,
+                    [*additional_include_directories, include_root],
+                    False,
+                    True,
+                )
+            )
+
+        worker_count = min(8, max(1, os.cpu_count() or 1))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count
+        ) as executor:
+            futures = [
+                executor.submit(
+                    compile_source,
+                    compiler,
+                    source,
+                    object_path,
+                    common_flags,
+                    include_directories,
+                    is_assembly,
+                    use_lto,
+                )
+                for source, object_path, include_directories, is_assembly, use_lto in compile_jobs
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        cache_object = next(
+            (
+                object_path
+                for source, object_path in zip(
+                    sdk_c_sources, sdk_c_objects, strict=True
+                )
+                if source.relative_to(source_root) == Path("arch/riscv/cache.c")
+            ),
+            None,
+        )
+        ordered_sdk_c_objects = [
+            object_path for object_path in sdk_c_objects if object_path != cache_object
+        ]
+        linked_elf = temporary_root / "firmware.elf"
+        link_map = temporary_root / "firmware.map"
+        raw_firmware = temporary_root / "firmware.bin"
+        link_command = [
+            compiler,
+            "--target=riscv32-unknown-elf",
+            "-march=rv32imc_zicsr_zifencei",
+            "-mabi=ilp32",
+            "-mcmodel=medany",
+            "-mno-relax",
+            "-nostdlib",
+            "-fuse-ld=lld",
+            "-flto",
+            "-Oz",
+            f"-Wl,-T,{linker_script}",
+            f"-Wl,-Map,{link_map}",
+            "-Wl,--build-id=none",
+            "-Wl,--gc-sections",
+            "-Wl,--icf=safe",
+            "-Wl,--no-relax",
+            "-o",
+            str(linked_elf),
+        ]
+        if cache_object is not None:
+            link_command.append(str(cache_object))
+        link_command.extend(str(object_path) for object_path in user_c_objects)
+        link_command.extend(str(object_path) for object_path in user_objects)
+        link_command.extend(str(object_path) for object_path in ordered_sdk_c_objects)
+        link_command.extend(str(object_path) for object_path in sdk_assembly_objects)
+        link_command.append(str(platform_data_object))
+        if user_archives:
+            link_command.append("-Wl,--start-group")
+            link_command.extend(str(archive) for archive in user_archives)
+            link_command.append("-Wl,--end-group")
+        run_command(link_command, "linking firmware")
+        run_command(
+            [
+                objcopy,
+                "-O",
+                "binary",
+                "--strip-all",
+                "--only-section=.init",
+                "--only-section=.text",
+                "--only-section=.rodata",
+                str(linked_elf),
+                str(raw_firmware),
+            ],
+            "creating raw firmware",
+        )
+        raw_data = temporary_root / "data.bin"
+        run_command(
+            [
+                objcopy,
+                "-O",
+                "binary",
+                "--strip-all",
+                "--only-section=.data",
+                str(linked_elf),
+                str(raw_data),
+            ],
+            "creating initialized data image",
+        )
+        raw_platform_data = temporary_root / "platform-data.bin"
+        run_command(
+            [
+                objcopy,
+                "-O",
+                "binary",
+                "--only-section=.data.platform",
+                str(platform_data_object),
+                str(raw_platform_data),
+            ],
+            "extracting platform data image",
+        )
+        platform_data = raw_platform_data.read_bytes()
+        if not platform_data:
+            raise BuildFailure("platform data image is empty")
+        if not raw_data.read_bytes().startswith(platform_data):
+            raise BuildFailure("generated data image lost the platform data prefix")
+        replace_output(raw_firmware, rv32_output)
+        replace_output(raw_data, data_output)
+        if debug_directory is not None:
+            replace_output(linked_elf, debug_directory / "firmware.elf")
+            replace_output(link_map, debug_directory / "firmware.map")
+
+    print(f"created {rv32_output} ({rv32_output.stat().st_size} bytes)")
+    print(f"created {data_output} ({data_output.stat().st_size} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BuildFailure as error:
+        print(f"airoha-npu-fdk-build: error: {error}", file=sys.stderr)
+        sys.exit(1)

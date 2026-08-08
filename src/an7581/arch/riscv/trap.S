@@ -1,0 +1,94 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+#include "an7581/runtime/trap.h"
+
+	.section .text.trap, "ax", @progbits
+	.balign 4
+	.globl trap_entry
+	.type trap_entry, @function
+	.option push
+	.option norelax
+trap_entry:
+	addi	sp, sp, -AN7581_TRAP_FRAME_SIZE
+	sw	ra, AN7581_TRAP_FRAME_RA_OFFSET(sp)
+	sw	t0, AN7581_TRAP_FRAME_T0_OFFSET(sp)
+	addi	t0, sp, AN7581_TRAP_FRAME_SIZE
+	sw	t0, AN7581_TRAP_FRAME_SP_OFFSET(sp)
+	sw	gp, AN7581_TRAP_FRAME_GP_OFFSET(sp)
+	sw	tp, AN7581_TRAP_FRAME_TP_OFFSET(sp)
+	sw	t1, AN7581_TRAP_FRAME_T1_OFFSET(sp)
+	sw	t2, AN7581_TRAP_FRAME_T2_OFFSET(sp)
+	sw	s0, AN7581_TRAP_FRAME_S0_OFFSET(sp)
+	sw	s1, AN7581_TRAP_FRAME_S1_OFFSET(sp)
+	sw	a0, AN7581_TRAP_FRAME_A0_OFFSET(sp)
+	sw	a1, AN7581_TRAP_FRAME_A1_OFFSET(sp)
+	sw	a2, AN7581_TRAP_FRAME_A2_OFFSET(sp)
+	sw	a3, AN7581_TRAP_FRAME_A3_OFFSET(sp)
+	sw	a4, AN7581_TRAP_FRAME_A4_OFFSET(sp)
+	sw	a5, AN7581_TRAP_FRAME_A5_OFFSET(sp)
+	sw	a6, AN7581_TRAP_FRAME_A6_OFFSET(sp)
+	sw	a7, AN7581_TRAP_FRAME_A7_OFFSET(sp)
+	sw	s2, AN7581_TRAP_FRAME_S2_OFFSET(sp)
+	sw	s3, AN7581_TRAP_FRAME_S3_OFFSET(sp)
+	sw	s4, AN7581_TRAP_FRAME_S4_OFFSET(sp)
+	sw	s5, AN7581_TRAP_FRAME_S5_OFFSET(sp)
+	sw	s6, AN7581_TRAP_FRAME_S6_OFFSET(sp)
+	sw	s7, AN7581_TRAP_FRAME_S7_OFFSET(sp)
+	sw	s8, AN7581_TRAP_FRAME_S8_OFFSET(sp)
+	sw	s9, AN7581_TRAP_FRAME_S9_OFFSET(sp)
+	sw	s10, AN7581_TRAP_FRAME_S10_OFFSET(sp)
+	sw	s11, AN7581_TRAP_FRAME_S11_OFFSET(sp)
+	sw	t3, AN7581_TRAP_FRAME_T3_OFFSET(sp)
+	sw	t4, AN7581_TRAP_FRAME_T4_OFFSET(sp)
+	sw	t5, AN7581_TRAP_FRAME_T5_OFFSET(sp)
+	sw	t6, AN7581_TRAP_FRAME_T6_OFFSET(sp)
+
+	csrr	a0, mcause
+	csrr	a1, mepc
+	csrr	a2, mtval
+	mv	a3, sp
+	csrr	a4, mhartid
+	call	an7581_trap_dispatch
+	beqz	a0, .Ltrap_fatal
+	csrw	mepc, a0
+
+	lw	ra, AN7581_TRAP_FRAME_RA_OFFSET(sp)
+	lw	gp, AN7581_TRAP_FRAME_GP_OFFSET(sp)
+	lw	tp, AN7581_TRAP_FRAME_TP_OFFSET(sp)
+	lw	t0, AN7581_TRAP_FRAME_T0_OFFSET(sp)
+	lw	t1, AN7581_TRAP_FRAME_T1_OFFSET(sp)
+	lw	t2, AN7581_TRAP_FRAME_T2_OFFSET(sp)
+	lw	s0, AN7581_TRAP_FRAME_S0_OFFSET(sp)
+	lw	s1, AN7581_TRAP_FRAME_S1_OFFSET(sp)
+	lw	a0, AN7581_TRAP_FRAME_A0_OFFSET(sp)
+	lw	a1, AN7581_TRAP_FRAME_A1_OFFSET(sp)
+	lw	a2, AN7581_TRAP_FRAME_A2_OFFSET(sp)
+	lw	a3, AN7581_TRAP_FRAME_A3_OFFSET(sp)
+	lw	a4, AN7581_TRAP_FRAME_A4_OFFSET(sp)
+	lw	a5, AN7581_TRAP_FRAME_A5_OFFSET(sp)
+	lw	a6, AN7581_TRAP_FRAME_A6_OFFSET(sp)
+	lw	a7, AN7581_TRAP_FRAME_A7_OFFSET(sp)
+	lw	s2, AN7581_TRAP_FRAME_S2_OFFSET(sp)
+	lw	s3, AN7581_TRAP_FRAME_S3_OFFSET(sp)
+	lw	s4, AN7581_TRAP_FRAME_S4_OFFSET(sp)
+	lw	s5, AN7581_TRAP_FRAME_S5_OFFSET(sp)
+	lw	s6, AN7581_TRAP_FRAME_S6_OFFSET(sp)
+	lw	s7, AN7581_TRAP_FRAME_S7_OFFSET(sp)
+	lw	s8, AN7581_TRAP_FRAME_S8_OFFSET(sp)
+	lw	s9, AN7581_TRAP_FRAME_S9_OFFSET(sp)
+	lw	s10, AN7581_TRAP_FRAME_S10_OFFSET(sp)
+	lw	s11, AN7581_TRAP_FRAME_S11_OFFSET(sp)
+	lw	t3, AN7581_TRAP_FRAME_T3_OFFSET(sp)
+	lw	t4, AN7581_TRAP_FRAME_T4_OFFSET(sp)
+	lw	t5, AN7581_TRAP_FRAME_T5_OFFSET(sp)
+	lw	t6, AN7581_TRAP_FRAME_T6_OFFSET(sp)
+	lw	sp, AN7581_TRAP_FRAME_SP_OFFSET(sp)
+	mret
+
+.Ltrap_fatal:
+	csrwi	mie, 0
+.Ltrap_park:
+	wfi
+	j	.Ltrap_park
+	.size trap_entry, . - trap_entry
+	.option pop
